@@ -1,0 +1,20 @@
+# Secrets
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Cache of model responses (regenerated at runtime)
+.cache/
+code/.cache/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# build artifact
+code.zip

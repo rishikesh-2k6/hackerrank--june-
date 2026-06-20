@@ -1,25 +1,60 @@
-# HackerRank Orchestrate
+# Multi-Modal Evidence Review
 
-Starter repository for the **HackerRank Orchestrate** 24-hour hackathon.
+A system that verifies damage claims for **cars, laptops, and packages** by
+inspecting the submitted images alongside the claim conversation, the user's
+claim history, and the minimum evidence requirements. It reads
+`dataset/claims.csv` and produces `output.csv` with the exact 14-column schema in
+[`problem_statement.md`](./problem_statement.md).
 
-Build a system that verifies visual evidence for damage claims across three object types: **cars**, **laptops**, and **packages**.
-
-Your system will receive claim conversations, one or more submitted images, user claim history, and minimum evidence requirements. It must decide whether the submitted images support the claim, contradict it, or do not provide enough information.
-
-Read [`problem_statement.md`](./problem_statement.md) for the full task spec, input/output schema, and allowed values.
+Built for the **HackerRank Orchestrate** (June 2026) challenge.
 
 ---
 
-## Contents
+## Approach
 
-1. [Repository layout](#repository-layout)
-2. [What you need to build](#what-you-need-to-build)
-3. [Where your code goes](#where-your-code-goes)
-4. [Quickstart](#quickstart)
-5. [Evaluation](#evaluation)
-6. [Chat transcript logging](#chat-transcript-logging)
-7. [Submission](#submission)
-8. [Judge interview](#judge-interview)
+**One structured vision-model call per claim.** For each row, the system sends a
+single request containing:
+
+- all of the claim's images (decoded, downscaled, and sent **once** each),
+- the claim chat transcript (what to verify),
+- the matched minimum-evidence requirement for that object type,
+- the user's history summary (as *risk context only*).
+
+The model returns every decision field as JSON. A **deterministic rule layer**
+then folds in non-visual, history-based risk and clamps every field to the
+allowed vocabularies, so each output row is schema-legal and reproducible.
+
+Guiding principles, straight from the task:
+
+- **Images are the source of truth.** The conversation defines what to check.
+- **History adds risk context only** — it never overrides clear visual evidence
+  on its own. That contribution is applied deterministically and is auditable.
+- **No hardcoded labels.** Decisions come from the model + generic rules.
+
+### Why this design
+
+| Choice | Reason |
+|---|---|
+| Single call per claim (not multi-agent) | Cheapest / lowest latency for a 64-row dataset; easy to make deterministic. |
+| Deterministic post-processing | History risk + enum clamping are auditable and reproducible, not left to the model. |
+| Disk cache keyed on the full input | Each image/claim hits the model at most once; re-runs and sample/test overlap are free. |
+| Provider-agnostic (OpenAI-compatible) | Endpoint/model swappable via `.env` with no code changes. |
+
+---
+
+## Model / provider
+
+Provider-agnostic through the OpenAI-compatible chat API. The default target is
+**GLM-5.1 served on NVIDIA NIM**:
+
+```
+NVIDIA_BASE_URL = https://integrate.api.nvidia.com/v1
+GLM_MODEL       = z-ai/glm-5.1
+```
+
+Any OpenAI-compatible vision model works — change `GLM_MODEL` / `NVIDIA_BASE_URL`
+in `.env`. (If a model can't accept images, switch to a vision variant such as
+`z-ai/glm-4.5v`.)
 
 ---
 
@@ -27,135 +62,132 @@ Read [`problem_statement.md`](./problem_statement.md) for the full task spec, in
 
 ```text
 .
-├── AGENTS.md                         # Rules for AI coding tools + transcript logging
-├── problem_statement.md              # Full task description and I/O schema
-├── README.md                         # You are here
-├── code/                             # Build your solution here
-│   ├── main.py                       # Suggested terminal entry point
+├── README.md                     # You are here
+├── problem_statement.md          # Full task spec and I/O schema
+├── AGENTS.md                     # Agent rules + chat-transcript logging
+├── .env.example                  # Copy to .env and add your key
+├── code/                         # The solution (this is what gets zipped)
+│   ├── main.py                   # CLI: claims.csv -> output.csv
+│   ├── config.py                 # Paths, model config, .env loading
+│   ├── requirements.txt
+│   ├── README.md                 # Code-level docs
+│   ├── agent/
+│   │   ├── schema.py             # 14-col order + allowed values + coercion
+│   │   ├── loaders.py            # CSV + image loading / downscaling
+│   │   ├── prompt.py             # System prompt + multimodal user message
+│   │   ├── client.py             # OpenAI-compatible call + JSON parsing + retry
+│   │   ├── risk_rules.py         # History-risk merge + schema clamping
+│   │   ├── cache.py              # Disk cache of model responses
+│   │   └── pipeline.py           # Process one claim end-to-end
 │   └── evaluation/
-│       └── main.py                   # Suggested evaluation entry point
-└── dataset/
-    ├── sample_claims.csv             # Inputs + expected outputs for development
-    ├── claims.csv                    # Inputs only; run your system on these rows
-    ├── user_history.csv              # Historical claim counts and risk context
-    ├── evidence_requirements.csv     # Minimum image evidence requirements
-    └── images/
-        ├── sample/                   # Images referenced by sample_claims.csv
-        └── test/                     # Images referenced by claims.csv
+│       ├── main.py               # Score vs sample labels
+│       └── evaluation_report.md  # Generated: metrics + cost/latency analysis
+├── docs/superpowers/specs/       # Design spec
+└── dataset/                      # Provided corpus (excluded from the code zip)
 ```
 
 ---
 
-## What you need to build
-
-A system that, for each row in `dataset/claims.csv`, produces one row in `output.csv`.
-
-Input fields:
-
-| Column | Meaning |
-|---|---|
-| `user_id` | User submitting the claim; use this to look up `dataset/user_history.csv` |
-| `image_paths` | One or more submitted image paths, separated by semicolons |
-| `user_claim` | Chat transcript describing the issue |
-| `claim_object` | `car`, `laptop`, or `package` |
-
-Required output fields:
-
-| Column | Meaning |
-|---|---|
-| `evidence_standard_met` | Whether the image set is sufficient to evaluate the claim |
-| `evidence_standard_met_reason` | Short reason for the evidence decision |
-| `risk_flags` | Semicolon-separated risk flags, or `none` |
-| `issue_type` | Visible issue type |
-| `object_part` | Relevant object part |
-| `claim_status` | `supported`, `contradicted`, or `not_enough_information` |
-| `claim_status_justification` | Concise explanation grounded in the image evidence |
-| `supporting_image_ids` | Image IDs supporting the decision, or `none` |
-| `valid_image` | Whether the image set is usable for automated review |
-| `severity` | `none`, `low`, `medium`, `high`, or `unknown` |
-
-Hard requirements:
-
-- Must read the provided CSV files and local images.
-- Must produce `output.csv` with the exact schema in `problem_statement.md`.
-- Must include an evaluation workflow
-- Must avoid hardcoded test labels or file-specific answers.
-
-Beyond that you are free to bring your own approach: VLMs, LLMs, structured prompting, rule layers, batching, caching, evaluation pipelines, model comparison, or anything else.
-
----
-
-## Where your code goes
-
-All of your work belongs in [`code/`](./code/). The repo ships with empty starter files that you can grow into your full solution.
-
-Suggested conventions:
-
-- Put your main runnable solution in `code/main.py`, or document your own entry point clearly.
-- Put evaluation code under `code/evaluation/` or an `evaluation/` folder included in your final `code.zip`.
-- Write final predictions to `output.csv`.
-
----
-
-## Quickstart
-
-Clone this repository:
+## Setup
 
 ```bash
-git clone git@github.com:interviewstreet/hackerrank-orchestrate-june26.git
-cd hackerrank-orchestrate-june26
+pip install -r code/requirements.txt
+cp .env.example .env          # then paste your key into .env
 ```
 
-You are free to use any language or runtime. Python, JavaScript, and TypeScript are all reasonable choices.
+`.env` (repo root — **git-ignored, never committed**):
+
+```
+NVIDIA_API_KEY=...                 # required
+NVIDIA_BASE_URL=https://integrate.api.nvidia.com/v1
+GLM_MODEL=z-ai/glm-5.1
+```
+
+Secrets are read from the environment / `.env` only — nothing is hardcoded.
+
+---
+
+## Run
+
+```bash
+# Smoke test on the first 2 rows (confirms the model + image input work)
+python code/main.py --limit 2
+
+# Full test set -> dataset/output.csv
+python code/main.py
+
+# Evaluation on the labeled sample set -> code/evaluation/
+python code/evaluation/main.py
+```
+
+Useful flags: `--limit N`, `--no-cache`, `--claims PATH`, `--out PATH`,
+`--dataset-dir PATH` (so a grader can point at its own data).
+
+---
+
+## Output schema
+
+`output.csv` has one row per input claim with these columns, in order:
+
+`user_id, image_paths, user_claim, claim_object, evidence_standard_met,
+evidence_standard_met_reason, risk_flags, issue_type, object_part, claim_status,
+claim_status_justification, supporting_image_ids, valid_image, severity`
+
+`claim_status` ∈ `supported | contradicted | not_enough_information`. All other
+enumerated fields are clamped to the vocabularies in `problem_statement.md`.
 
 ---
 
 ## Evaluation
 
-The evaluation report should include:
+`python code/evaluation/main.py` runs the pipeline on `sample_claims.csv`
+(inputs only), compares predictions to the labeled columns, and writes
+`code/evaluation/evaluation_report.md` containing:
 
-- metrics on `dataset/sample_claims.csv`
-- at least two strategies, prompts, or model configurations compared
-- the final strategy used for `output.csv`
-- operational analysis covering model calls, token usage, image usage, approximate cost, runtime, and TPM/RPM considerations
+- per-field exact-match accuracy and the `claim_status` confusion matrix,
+- set-based precision / recall / F1 for `risk_flags` and `supporting_image_ids`,
+- **operational analysis**: model calls, images processed, token usage, projected
+  full-test-set cost, runtime, and the caching / retry / rate-limit strategy.
+
+The model is configurable via `.env`, so swapping `GLM_MODEL` lets you compare
+configurations against the same harness.
+
+---
+
+## Cost, latency & reliability
+
+- **~1 model call per claim** (~44 for the test set, ~82 images). All of a row's
+  images go in one request — no per-image or multi-pass calls.
+- **Disk cache** (`code/.cache/`) keyed on model + claim + requirement + history
+  + image bytes: re-runs cost zero calls.
+- **Image downscaling** to a bounded long edge limits image tokens and payload.
+- **Retry with exponential backoff** on transient/429 errors; JSON-mode with a
+  graceful fallback to robust parsing; deterministic fallback row when an image
+  set is unusable or a call fails.
+- NVIDIA NIM's free tier means real spend is ≈ $0; the report also gives a
+  paid-equivalent reference cost.
 
 ---
 
 ## Chat transcript logging
 
-This repo ships with an `AGENTS.md` that modern AI coding tools may read. It instructs the tool to append conversation turns to a shared log file:
+Per `AGENTS.md`, the development chat transcript is appended to a log file
+outside the repo (never committed):
 
 | Platform | Path |
 |---|---|
 | macOS / Linux | `$HOME/hackerrank_orchestrate/log.txt` |
 | Windows | `%USERPROFILE%\hackerrank_orchestrate\log.txt` |
 
-You will upload this log as your chat transcript at submission time. The chat transcript means your conversation with the AI coding tool you used to build the system. It is not the runtime logs, reasoning trace, or conversation history produced by the claim-verification agent you are building.
-
-If you use multiple AI tools, include the relevant conversation logs from all of them in the same transcript file. Separate each tool's section with a clear divider and label it with the tool name.
-
-Never paste secrets into the chat. If secrets are needed, use environment variables.
+This is uploaded as the chat transcript at submission time.
 
 ---
 
-## Submission
+## Submission checklist
 
-Submit the following files as instructed by HackerRank:
+1. **Code zip** — zip `code/` (excludes venvs, caches, and `dataset/`).
+2. **Predictions CSV** — `output.csv` for every row in `dataset/claims.csv`.
+3. **Chat transcript** — `log.txt` from the path above.
 
-1. **Code zip**: zip your runnable solution, README, prompts/configs, and evaluation folder. Exclude virtualenvs, `node_modules`, build artifacts, and unnecessary generated files.
-2. **Predictions CSV**: your final `output.csv` for all rows in `dataset/claims.csv`.
-3. **Chat transcript**: the `log.txt` from the path in [Chat transcript logging](#chat-transcript-logging).
-
-Before submitting, confirm:
-
-- `output.csv` has one row per row in `dataset/claims.csv`.
-- `output.csv` has the exact required columns in the exact required order.
-- Your evaluation files are included in `code.zip`.
-
----
-
-## Judge interview
-
-After submission, the AI Judge may ask about your approach, implementation decisions, model usage, evaluation strategy, and how you used AI while building the solution.
-
-Be prepared to explain your solution in detail.
+Before submitting, confirm `output.csv` has one row per input row and the exact
+columns in the exact order, and that the `evaluation/` folder is included.
